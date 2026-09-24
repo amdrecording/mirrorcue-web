@@ -33,7 +33,7 @@
   #prompter { background: #000; }
   #stage { position: absolute; left: 0; right: 0; bottom: 0; top: env(safe-area-inset-top); overflow: hidden; }
   #box { position: absolute; left: 50%; top: 50%; transform-origin: center; }
-  #frame { position: absolute; left: 50%; top: 0; transform: translateX(-50%); overflow: hidden; }
+  #frame { position: absolute; left: 0; top: 0; transform-origin: center; overflow: hidden; }
   #content { position: relative; width: 100%; padding: 0 16px; transition: transform 0.18s ease-out; will-change: transform; }
   #content.nolerp { transition: none; }
   .p { margin: 0; font-weight: 600; word-wrap: break-word; }
@@ -111,6 +111,7 @@
     <div class="setting"><label>Width <b id="v-width"></b></label><input type="range" id="s-width" min="0.3" max="1" step="0.05"></div>
     <div class="setting"><label>Height <b id="v-height"></b></label><input type="range" id="s-height" min="0.2" max="1" step="0.05"></div>
     <div class="setting"><label>Top offset <b id="v-top"></b></label><input type="range" id="s-top" min="0" max="0.7" step="0.02"></div>
+    <div class="setting"><label>Side offset <b id="v-side"></b></label><input type="range" id="s-side" min="-0.5" max="0.5" step="0.02"></div>
     <div class="setting"><label>Reading line <b id="v-anchor"></b></label><input type="range" id="s-anchor" min="0" max="0.5" step="0.02"></div>
     <div class="setting"><label>Rotation</label><select id="s-rotation"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></div>
     <div class="setting"><label>Mirror flip</label><button class="toggle" id="s-mirror"></button></div>
@@ -140,7 +141,7 @@
     save('mc.scripts', scripts);
   }
   const settings = Object.assign({
-    font: 24, spacing: 0.3, width: 1, height: 1, top: 0, anchor: 0, rotation: 0,
+    font: 24, spacing: 0.3, width: 1, height: 1, top: 0, side: 0, anchor: 0, rotation: 0,
     mirror: false, center: false, commands: true, heard: true, speed: 40, listen: true
   }, load('mc.settings', {}));
   const saveSettings = () => save('mc.settings', settings);
@@ -219,13 +220,18 @@
     box.style.width = boxW + 'px'; box.style.height = boxH + 'px';
     box.style.transform = `translate(-50%,-50%) rotate(${rot}deg)`;
     const frame = $('frame');
-    frame.style.width = Math.round(boxW * settings.width) + 'px';
+    const frameW = Math.round(boxW * settings.width);
+    frame.style.width = frameW + 'px';
+    // Side offset slides the block left (negative) or right (positive) from
+    // center, clamped so it never leaves the screen.
+    const leftPx = Math.max(0, Math.min(boxW - frameW, Math.round(boxW / 2 + boxW * settings.side - frameW / 2)));
+    frame.style.left = leftPx + 'px';
     // Top offset pushes the whole text block down; height is measured from
     // there and can't run past the bottom edge.
     const topPx = Math.round(boxH * settings.top);
     frame.style.top = topPx + 'px';
     frame.style.height = Math.min(Math.round(boxH * settings.height), boxH - topPx) + 'px';
-    frame.style.transform = `translateX(-50%) scaleX(${settings.mirror ? -1 : 1})`;
+    frame.style.transform = `scaleX(${settings.mirror ? -1 : 1})`;
     const content = $('content');
     content.style.fontSize = settings.font + 'px';
     content.style.lineHeight = (1.2 + Math.max(-0.35, settings.spacing)) + '';
@@ -234,7 +240,7 @@
     $('heard').style.display = settings.heard ? '' : 'none';
     $('playBtn').style.display = listening ? 'none' : '';
     for (const [k, fmt] of [['font', v => v + 'px'], ['spacing', v => Math.round(v * 100) + '%'], ['width', v => Math.round(v * 100) + '%'],
-                            ['height', v => Math.round(v * 100) + '%'], ['top', v => Math.round(v * 100) + '%'], ['anchor', v => Math.round(v * 100) + '%'], ['speed', v => v]]) {
+                            ['height', v => Math.round(v * 100) + '%'], ['top', v => Math.round(v * 100) + '%'], ['side', v => (v > 0 ? '+' : '') + Math.round(v * 100) + '%'], ['anchor', v => Math.round(v * 100) + '%'], ['speed', v => v]]) {
       $('s-' + k).value = settings[k]; $('v-' + k).textContent = fmt(settings[k]);
     }
     $('s-rotation').value = settings.rotation;
@@ -339,7 +345,7 @@
   $('closeBtn').onclick = () => { stopListening(); autoScrolling = false; show('library'); };
   $('settingsBtn').onclick = () => $('settings').classList.add('open');
   $('settingsDone').onclick = () => $('settings').classList.remove('open');
-  for (const k of ['font', 'spacing', 'width', 'height', 'top', 'anchor', 'speed']) {
+  for (const k of ['font', 'spacing', 'width', 'height', 'top', 'side', 'anchor', 'speed']) {
     $('s-' + k).addEventListener('input', e => { settings[k] = Number(e.target.value); saveSettings(); applySettings(); layout(false); });
   }
   $('s-rotation').onchange = e => { settings.rotation = Number(e.target.value); saveSettings(); applySettings(); layout(false); };
