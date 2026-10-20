@@ -37,18 +37,24 @@
     return false;
   }
 
-  function lcsLength(a, b) {
-    const dp = new Array(b.length + 1).fill(0);
+  // LCS of `a` against tokens[start..end] (inclusive), reusing one buffer so
+  // the per-candidate loop allocates nothing (matters on old iPads).
+  let dpBuf = new Int32Array(64);
+  function lcsRange(a, tokens, start, end) {
+    const n = end - start + 1;
+    if (dpBuf.length < n + 1) dpBuf = new Int32Array(n + 1);
+    const dp = dpBuf; dp.fill(0, 0, n + 1);
     for (let i = 1; i <= a.length; i++) {
       let prevDiag = 0;
-      for (let j = 1; j <= b.length; j++) {
+      const ai = a[i - 1];
+      for (let j = 1; j <= n; j++) {
         const temp = dp[j];
-        if (fuzzyEqual(a[i - 1], b[j - 1])) dp[j] = prevDiag + 1;
-        else dp[j] = Math.max(dp[j], dp[j - 1]);
+        if (fuzzyEqual(ai, tokens[start + j - 1])) dp[j] = prevDiag + 1;
+        else dp[j] = dp[j] > dp[j - 1] ? dp[j] : dp[j - 1];
         prevDiag = temp;
       }
     }
-    return dp[b.length];
+    return dp[n];
   }
 
   const TARGET_WORDS = 8, HARD_CAP = 11;
@@ -107,7 +113,9 @@
 
     /** Feed the latest (partial) transcript; returns {lineIndex, tokenIndex} or null. */
     update(transcript) {
-      const spoken = normalize(transcript);
+      // Only the newest words matter for alignment. Normalizing the whole
+      // session transcript made every update slower the longer you talked.
+      const spoken = normalize(transcript.trim().split(/\s+/).slice(-16).join(' '));
       if (!spoken.length || !this.tokens.length) return null;
 
       // Fast path: newest heard word is one of the next few expected words.
@@ -125,13 +133,18 @@
 
       const tail = spoken.slice(-10), k = tail.length;
       let lo, hi;
-      if (this.missStreak >= 4 || this.current < 0) { lo = 0; hi = this.tokens.length - 1; }
-      else { lo = Math.max(0, this.current - 80); hi = Math.min(this.tokens.length - 1, this.current + 200); }
+      // Whole-script search is the expensive case (off-script talk, noise).
+      // Allow it at most once a second so it can't swamp a slow device.
+      const now = Date.now();
+      if ((this.missStreak >= 4 || this.current < 0) && now - (this.lastFull || 0) > 1000) {
+        lo = 0; hi = this.tokens.length - 1; this.lastFull = now;
+      }
+      else { const c = Math.max(0, this.current); lo = Math.max(0, c - 80); hi = Math.min(this.tokens.length - 1, c + 200); }
 
       let bestScore = 0, bestEnd = -1;
       for (let end = lo; end <= hi; end++) {
         const start = Math.max(0, end - k - 2);
-        const overlap = lcsLength(tail, this.tokens.slice(start, end + 1));
+        const overlap = lcsRange(tail, this.tokens, start, end);
         let score = overlap / k;
         // Prefer the end that actually IS the last word heard, so a full
         // match can't overshoot into the words that follow it.

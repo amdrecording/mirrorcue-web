@@ -46,6 +46,7 @@
   #bottombar { position: absolute; bottom: calc(env(safe-area-inset-bottom) + 12px); left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; }
   .round { width: 48px; height: 48px; border-radius: 24px; border: 0; background: rgba(0,0,0,.55); color: #fff; font-size: 20px; }
   .round.on { background: #ffd60a; color: #000; }
+  .pill { height: 48px; padding: 0 16px; border-radius: 24px; border: 0; background: rgba(255,255,255,.14); color: #fff; font-size: 16px; font-weight: 600; }
   #controls { display: flex; gap: 14px; padding: 10px 18px; background: rgba(0,0,0,.5); border-radius: 40px; }
   #heard { font-size: 13px; color: rgba(255,255,255,.8); background: rgba(0,0,0,.5); padding: 4px 12px; border-radius: 20px; max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #heard.warn { color: #ffb347; white-space: normal; }
@@ -101,11 +102,13 @@
         <button class="round" id="listenBtn" title="Follow my voice">🎤</button>
         <button class="round" id="playBtn" title="Auto-scroll" style="display:none">▶</button>
         <button class="round" id="settingsBtn" title="Settings">⚙︎</button>
+        <button class="pill" id="resetMicBtn" title="Restart the microphone">Reset mic</button>
       </div>
     </div>
   </div>
   <div id="settings">
     <h2>Prompter settings <button class="btn" id="settingsDone">Done</button></h2>
+    <div class="setting"><label>Listening stuck?</label><button class="btn" id="reloadAppBtn">Reload app (keeps your place)</button></div>
     <div class="setting"><label>Text size <b id="v-font"></b></label><input type="range" id="s-font" min="8" max="90" step="1"></div>
     <div class="setting"><label>Line spacing <b id="v-spacing"></b></label><input type="range" id="s-spacing" min="-0.35" max="1" step="0.05"></div>
     <div class="setting"><label>Width <b id="v-width"></b></label><input type="range" id="s-width" min="0.3" max="1" step="0.05"></div>
@@ -198,7 +201,7 @@
   }
 
   function buildContent() {
-    const content = $('content'); content.innerHTML = ''; spans = [];
+    const content = $('content'); content.innerHTML = ''; spans = []; invalidateTops(); paintedIdx = -1;
     for (const cells of matcher.paragraphs) {
       const p = document.createElement('div'); p.className = 'p';
       cells.forEach((cell, i) => {
@@ -245,29 +248,55 @@
     }
     $('s-rotation').value = settings.rotation;
     for (const k of ['mirror', 'center', 'commands', 'heard']) $('s-' + k).classList.toggle('on', !!settings[k]);
+    invalidateTops();
   }
 
   /** Scroll so the top of the line holding the spoken word sits at the reading line. */
+  // Word positions are measured once per layout change, never during speech.
+  // Reading offsetTop for every word on every update forced the old iPad to
+  // re-lay-out the page dozens of times per second, so updates queued up and
+  // the prompter fell seconds, then minutes, behind.
+  let tops = [], topsValid = false, paintedIdx = -1, paintAll = true;
+  function invalidateTops() { topsValid = false; paintAll = true; }
+  function measureTops() {
+    tops = new Array(spans.length);
+    for (let i = 0; i < spans.length; i++) tops[i] = spans[i] ? spans[i].offsetTop : 0;
+    topsValid = true;
+  }
   function layout(animated) {
     const frame = $('frame'), content = $('content');
     const frameH = frame.clientHeight;
     const anchorTop = Math.min(0.8, settings.anchor) * frameH;
+    if (!topsValid) measureTops();
     let lineTop = 0;
-    if (spokenIdx >= 0 && spans[spokenIdx]) lineTop = spans[spokenIdx].offsetTop;
+    if (spokenIdx >= 0 && spokenIdx < tops.length) lineTop = tops[spokenIdx];
     const progressed = Math.max(0, lineTop);
     content.classList.toggle('nolerp', !animated);
     content.style.transform = `translateY(${anchorTop - progressed + dragOffset}px)`;
     // highlight: spoken words dim; words on the spoken word's line and at/before it glow.
-    for (let i = 0; i < spans.length; i++) {
+    // Only repaint words between the old and new position (plus a line's
+    // worth either side), unless something forced a full repaint.
+    let lo = 0, hi = spans.length - 1;
+    if (!paintAll) {
+      lo = Math.max(0, Math.min(paintedIdx, spokenIdx) - 80);
+      hi = Math.min(spans.length - 1, Math.max(paintedIdx, spokenIdx) + 80);
+    }
+    for (let i = lo; i <= hi; i++) {
       const s = spans[i]; if (!s) continue;
-      const cls = i <= spokenIdx ? (s.offsetTop === lineTop ? 'w current' : 'w spoken') : 'w';
+      const cls = i <= spokenIdx ? (tops[i] === lineTop ? 'w current' : 'w spoken') : 'w';
       if (s.className !== cls) s.className = cls;
     }
+    paintedIdx = spokenIdx; paintAll = false;
   }
   window.addEventListener('resize', () => { applySettings(); layout(false); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { invalidateTops(); if (spans.length) layout(false); });
 
   // ---------- transcripts ----------
   function handleTranscript(text) {
+    // Everything below only needs the newest words. Working on the whole
+    // session transcript made each update slower the longer you spoke.
+    const all = text.trim().split(/\s+/);
+    if (all.length > 24) text = all.slice(-24).join(' ');
     if (settings.heard) { const words = text.trim().split(/\s+/); $('heard').textContent = '🎤 …' + words.slice(-8).join(' '); $('heard').className = ''; }
     if (settings.commands) {
       const cmd = commands.detect(text);
@@ -303,16 +332,54 @@
     const rec = new SR();
     rec.continuous = true; rec.interimResults = true; rec.lang = navigator.language || 'en-US';
     rec.onresult = e => {
+      // Safari keeps the whole session in e.results; only the last couple of
+      // results carry the words we need.
       let text = '';
-      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript + ' ';
-      handleTranscript(text);
+      for (let i = Math.max(0, e.results.length - 3); i < e.results.length; i++) text += e.results[i][0].transcript + ' ';
+      lastResultAt = Date.now();
+      queueTranscript(text);
     };
     rec.onerror = e => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { warn('Microphone access was denied. Allow it in Settings → Safari → Microphone, then reload.'); stopListening(); }
     };
     rec.onend = () => { if (listening && recognition === rec) { recognition = null; setTimeout(startRecognition, 30); } };
-    recognition = rec;
+    recognition = rec; sessionStart = Date.now(); lastResultAt = sessionStart;
     try { rec.start(); } catch (err) { warn('Could not start listening: ' + err.message); }
+  }
+
+  // Never let speech events pile up: keep only the newest transcript and
+  // process it once the page is free. A slow device skips stale partials
+  // instead of working through a backlog.
+  let pendingText = null, pendingScheduled = false;
+  function queueTranscript(text) {
+    pendingText = text;
+    if (pendingScheduled) return;
+    pendingScheduled = true;
+    setTimeout(() => { pendingScheduled = false; const t = pendingText; pendingText = null; if (t != null && listening) handleTranscript(t); }, 0);
+  }
+
+  // Safari's recognizer gets slower the longer one session runs, and can go
+  // quiet without ever reporting an error. Recycle it during a pause, force
+  // a fresh one every two minutes, and revive one that has gone silent.
+  let sessionStart = 0, lastResultAt = 0;
+  setInterval(() => {
+    if (!listening || !recognition) return;
+    const now = Date.now(), age = now - sessionStart, quiet = now - lastResultAt;
+    if ((age > 45000 && quiet > 1200) || age > 120000 || (quiet > 15000 && age > 15000)) restartRecognition();
+  }, 1000);
+
+  function resetMic() {
+    const wasAt = spokenIdx;
+    listening = false;
+    if (recognition) { const r = recognition; recognition = null; try { r.abort(); } catch {} }
+    pendingText = null; commands.reset();
+    $('heard').textContent = '🎤 Restarting microphone…'; $('heard').className = ''; $('heard').style.display = '';
+    setTimeout(() => {
+      matcher.seek(wasAt); spokenIdx = wasAt;
+      settings.listen = true; saveSettings();
+      startListening();
+      $('heard').textContent = '🎤 Listening'; $('heard').style.display = settings.heard ? '' : 'none';
+    }, 600);
   }
   function restartRecognition() { if (!listening) return; const r = recognition; recognition = null; try { r && r.abort(); } catch {} setTimeout(startRecognition, 30); }
   function warn(msg) { $('heard').textContent = '⚠️ ' + msg; $('heard').className = 'warn'; $('heard').style.display = ''; }
@@ -341,6 +408,17 @@
 
   // ---------- buttons ----------
   $('listenBtn').onclick = () => { settings.listen = !listening; saveSettings(); if (listening) stopListening(); else startListening(); };
+  $('resetMicBtn').onclick = resetMic;
+  $('reloadAppBtn').onclick = () => {
+    try { sessionStorage.setItem('mc.resume', JSON.stringify({ id: currentScript && currentScript.id, at: spokenIdx })); } catch {}
+    location.reload();
+  };
+  try {
+    const resume = JSON.parse(sessionStorage.getItem('mc.resume') || 'null');
+    sessionStorage.removeItem('mc.resume');
+    const s = resume && scripts.find(x => x.id === resume.id);
+    if (s) { openPrompter(s); matcher.seek(resume.at); spokenIdx = resume.at; layout(false); }
+  } catch {}
   $('restartBtn').onclick = () => { matcher.reset(); spokenIdx = -1; dragOffset = 0; layout(true); restartRecognition(); };
   $('closeBtn').onclick = () => { stopListening(); autoScrolling = false; show('library'); };
   $('settingsBtn').onclick = () => $('settings').classList.add('open');
