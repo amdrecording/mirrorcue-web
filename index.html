@@ -110,7 +110,9 @@
   <div id="settings">
     <h2>Prompter settings <button class="btn" id="settingsDone">Done</button></h2>
     <div class="setting"><label>Listening stuck?</label><button class="btn" id="reloadAppBtn">Reload app (keeps your place)</button></div>
-    <p class="hint version-label" style="margin:10px 0 0"></p>
+    <p class="hint" id="micDiag" style="margin:10px 0 0">Mic status: not started</p>
+    <pre id="micLog" style="margin:6px 0 0; padding:8px 10px; background:#111; border-radius:8px; color:#9a9a9f; font-size:11px; line-height:1.4; white-space:pre-wrap; max-height:180px; overflow:auto">No microphone activity yet.</pre>
+    <p class="hint version-label" style="margin:4px 0 0"></p>
     <div class="setting"><label>Text size <b id="v-font"></b></label><input type="range" id="s-font" min="8" max="90" step="1"></div>
     <div class="setting"><label>Line spacing <b id="v-spacing"></b></label><input type="range" id="s-spacing" min="-0.35" max="1" step="0.05"></div>
     <div class="setting"><label>Width <b id="v-width"></b></label><input type="range" id="s-width" min="0.3" max="1" step="0.05"></div>
@@ -133,7 +135,7 @@
 (function () {
   'use strict';
   // Bump on every release so the iPad can show which build it's running.
-  const APP_VERSION = 'Version 1.3 · Oct 19, 2026';
+  const APP_VERSION = 'Version 1.4 · Oct 19, 2026';
   document.querySelectorAll('.version-label').forEach(el => el.textContent = APP_VERSION);
   const { ScriptMatcher, VoiceCommandDetector } = window.MirrorCueMatcher;
   const $ = id => document.getElementById(id);
@@ -331,26 +333,100 @@
     if (!SR) { warn('Speech recognition isn’t available in this browser. On iPad, use Safari (iOS 14.5 or later) with Siri & Dictation enabled.'); listening = false; updateListenUI(); return; }
     listening = true; updateListenUI(); startRecognition();
   }
-  function stopListening() { listening = false; updateListenUI(); if (recognition) { const r = recognition; recognition = null; try { r.abort(); } catch {} } }
+  function stopListening() { listening = false; updateListenUI(); clearTimeout(startTimer); clearTimeout(stopTimer); startTimer = stopTimer = null; if (recognition) { const r = recognition; recognition = null; try { r.abort(); } catch {} } }
+  // ---- recognizer lifecycle ----
+  // One recognizer at a time, strictly in sequence: a new one starts only
+  // after the old one has reported onend. Safari breaks if a new session
+  // starts while the old one is still shutting down.
+  let sessionStart = 0, lastResultAt = 0, gotStart = false, failStreak = 0, lastError = '', stopTimer = null, startTimer = null;
+  const ERROR_TEXT = {
+    'network': 'No internet for speech. Safari sends your voice to Apple to turn it into text, so the iPad needs working internet. Check the hotel Wi-Fi login page.',
+    'not-allowed': 'Safari is blocking the microphone for this site. Tap aA in the address bar → Website Settings → Microphone → Allow, then tap Reset mic.',
+    'service-not-allowed': 'Speech recognition is turned off. Settings → General → Keyboard → turn on Enable Dictation, then tap Reset mic.',
+    'audio-capture': 'The microphone is busy or unavailable. Close other apps that use the mic, then tap Reset mic.',
+    'language-not-supported': 'Speech isn’t available for this language. Check Settings → General → Keyboard → Dictation Languages.'
+  };
+  // Rolling log of what Safari's recognizer did, shown in Settings so a
+  // screenshot tells us exactly where it's failing.
+  const micLog = [];
+  function logMic(ev) {
+    const t = new Date(); const stamp = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    micLog.push(stamp + '  ' + ev); if (micLog.length > 12) micLog.shift();
+    const el = $('micLog'); if (el) el.textContent = micLog.join('\n');
+  }
+  function setMicStatus(msg, isWarn) {
+    $('heard').textContent = (isWarn ? '⚠️ ' : '🎤 ') + msg;
+    $('heard').className = isWarn ? 'warn' : '';
+    $('heard').style.display = (isWarn || settings.heard) ? '' : 'none';
+    const d = $('micDiag'); if (d) d.textContent = 'Mic status: ' + msg + ' (' + new Date().toLocaleTimeString() + ')';
+  }
+
   function startRecognition() {
-    if (!listening) return;
-    const rec = new SR();
+    clearTimeout(startTimer); startTimer = null;
+    if (!listening || recognition) return;
+    let rec;
+    try { rec = new SR(); } catch (err) { setMicStatus('Could not create the speech recognizer: ' + err.message, true); return; }
     rec.continuous = true; rec.interimResults = true; rec.lang = navigator.language || 'en-US';
+    gotStart = false; lastError = '';
+    rec.onstart = () => { if (recognition !== rec) return; gotStart = true; logMic('start'); };
+    rec.onaudiostart = () => { if (recognition !== rec) return; gotStart = true; logMic('mic on'); if (!lastResultAt || $('heard').className === 'warn') setMicStatus('Listening — start reading'); };
     rec.onresult = e => {
+      if (recognition !== rec) return;
       // Safari keeps the whole session in e.results; only the last couple of
       // results carry the words we need.
       let text = '';
       for (let i = Math.max(0, e.results.length - 3); i < e.results.length; i++) text += e.results[i][0].transcript + ' ';
-      lastResultAt = Date.now();
+      if (lastResultAt < sessionStart) logMic('heard words'); lastResultAt = Date.now(); failStreak = 0;
       queueTranscript(text);
     };
     rec.onerror = e => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { warn('Microphone access was denied. Allow it in Settings → Safari → Microphone, then reload.'); stopListening(); }
+      if (recognition !== rec) return;
+      lastError = e.error || 'unknown'; logMic('error: ' + lastError + (e.message ? ' (' + e.message + ')' : ''));
+      if (lastError === 'no-speech') return;   // harmless: just silence
+      // We only ever abort sessions we've already let go of (recognition !==
+      // rec), so an 'aborted' that reaches here came from Safari itself —
+      // usually its speech engine failing to start.
+      if (lastError === 'aborted') {
+        lastError = 'engine';
+        setMicStatus('Safari’s speech engine failed to start' + (e.message ? ' (“' + e.message + '”)' : '') + '. Close Safari completely (swipe it away) and reopen. If that fails, restart the iPad.', true);
+        return;
+      }
+      setMicStatus(ERROR_TEXT[lastError] || ('Speech error: ' + lastError), true);
+      if (lastError === 'not-allowed' || lastError === 'service-not-allowed') { listening = false; updateListenUI(); }
     };
-    rec.onend = () => { if (listening && recognition === rec) { recognition = null; setTimeout(startRecognition, 30); } };
-    recognition = rec; sessionStart = Date.now(); lastResultAt = sessionStart;
-    try { rec.start(); } catch (err) { warn('Could not start listening: ' + err.message); }
+    rec.onend = () => {
+      if (recognition !== rec) return;
+      clearTimeout(stopTimer); stopTimer = null;
+      recognition = null;
+      logMic('end after ' + ((Date.now() - sessionStart) / 1000).toFixed(1) + 's');
+      if (!listening) return;
+      // A session that died fast without hearing anything counts as a
+      // failure; back off so we never hammer Safari with restarts.
+      const quickDeath = Date.now() - sessionStart < 3000 && lastResultAt < sessionStart;
+      const benign = !lastError || lastError === 'no-speech';
+      if (quickDeath || !benign) failStreak++; else failStreak = 0;
+      const delay = failStreak === 0 ? 250 : Math.min(10000, 500 * Math.pow(2, failStreak - 1));
+      if (failStreak >= 4 && !lastError) setMicStatus('Safari keeps stopping the microphone. Tap Reset mic. If that fails, close Safari completely and reopen it.', true);
+      startTimer = setTimeout(startRecognition, delay);
+    };
+    recognition = rec; sessionStart = Date.now();
+    logMic('starting session' + (failStreak ? ' (retry ' + failStreak + ')' : '') + (navigator.onLine === false ? ' — iPad says offline' : ''));
+    try { rec.start(); }
+    catch (err) { recognition = null; logMic('start threw: ' + err.message); setMicStatus('Could not start listening: ' + err.message, true); failStreak++; startTimer = setTimeout(startRecognition, Math.min(10000, 1000 * failStreak)); return; }
+    // If Safari never confirms the session started, say so instead of
+    // sitting there silently.
+    setTimeout(() => { if (recognition === rec && !gotStart && listening) setMicStatus('Waiting for the microphone… if Safari is asking for permission, tap Allow.'); }, 3000);
+    setTimeout(() => { if (recognition === rec && !gotStart && listening) setMicStatus('The microphone didn’t start. Tap Reset mic. If it still fails, close Safari completely (swipe it away) and reopen.', true); }, 12000);
   }
+
+  // Graceful recycle: ask the session to stop and let onend start the next
+  // one. Abort only if Safari never answers.
+  function recycleRecognition() {
+    const r = recognition; if (!r || stopTimer) return;
+    try { r.stop(); } catch {}
+    stopTimer = setTimeout(() => { stopTimer = null; if (recognition === r) { try { r.abort(); } catch {} if (recognition === r && r.onend) r.onend(); } }, 3000);
+  }
+  function restartRecognition() { if (!listening) return; if (recognition) recycleRecognition(); else startRecognition(); }
 
   // Never let speech events pile up: keep only the newest transcript and
   // process it once the page is free. A slow device skips stale partials
@@ -363,31 +439,46 @@
     setTimeout(() => { pendingScheduled = false; const t = pendingText; pendingText = null; if (t != null && listening) handleTranscript(t); }, 0);
   }
 
-  // Safari's recognizer gets slower the longer one session runs, and can go
-  // quiet without ever reporting an error. Recycle it during a pause, force
-  // a fresh one every two minutes, and revive one that has gone silent.
-  let sessionStart = 0, lastResultAt = 0;
+  // Safari's recognizer gets slower the longer one session runs. Recycle it
+  // during a pause after 45 s, or regardless after 2 minutes.
   setInterval(() => {
-    if (!listening || !recognition) return;
+    if (!listening || !recognition || stopTimer) return;
     const now = Date.now(), age = now - sessionStart, quiet = now - lastResultAt;
-    if ((age > 45000 && quiet > 1200) || age > 120000 || (quiet > 15000 && age > 15000)) restartRecognition();
+    if ((age > 45000 && quiet > 1500 && lastResultAt > sessionStart) || age > 120000) recycleRecognition();
   }, 1000);
 
-  function resetMic() {
+  // Reset mic: tear everything down, ask Safari for the microphone again
+  // (this brings back the "use the microphone?" prompt when Safari is set
+  // to Ask), then start a fresh recognizer.
+  async function resetMic() {
     const wasAt = spokenIdx;
-    listening = false;
+    listening = false; updateListenUI();
+    clearTimeout(startTimer); clearTimeout(stopTimer); startTimer = stopTimer = null;
     if (recognition) { const r = recognition; recognition = null; try { r.abort(); } catch {} }
-    pendingText = null; commands.reset();
-    $('heard').textContent = '🎤 Restarting microphone…'; $('heard').className = ''; $('heard').style.display = '';
+    pendingText = null; commands.reset(); failStreak = 0;
+    setMicStatus('Asking Safari for the microphone…');
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      try {
+        logMic('reset: asking for mic');
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        logMic('reset: mic allowed');
+        stream.getTracks().forEach(t => t.stop());
+      } catch (err) {
+        logMic('reset: mic refused — ' + (err && (err.name || err.message)));
+        const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
+        setMicStatus(denied ? ERROR_TEXT['not-allowed'] : ('Microphone unavailable: ' + (err && (err.name || err.message))), true);
+        return;
+      }
+    }
+    // Give iOS a moment to release the mic before speech grabs it.
     setTimeout(() => {
       matcher.seek(wasAt); spokenIdx = wasAt;
       settings.listen = true; saveSettings();
+      setMicStatus('Starting…');
       startListening();
-      $('heard').textContent = '🎤 Listening'; $('heard').style.display = settings.heard ? '' : 'none';
-    }, 600);
+    }, 400);
   }
-  function restartRecognition() { if (!listening) return; const r = recognition; recognition = null; try { r && r.abort(); } catch {} setTimeout(startRecognition, 30); }
-  function warn(msg) { $('heard').textContent = '⚠️ ' + msg; $('heard').className = 'warn'; $('heard').style.display = ''; }
+  function warn(msg) { setMicStatus(msg, true); }
   function updateListenUI() { $('listenBtn').classList.toggle('on', listening); $('playBtn').style.display = listening ? 'none' : ''; }
 
   // ---------- manual scroll ----------
