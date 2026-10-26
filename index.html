@@ -139,7 +139,7 @@
 (function () {
   'use strict';
   // Bump on every release so the iPad can show which build it's running.
-  const APP_VERSION = 'Version 1.5 · Oct 26, 2026';
+  const APP_VERSION = 'Version 1.6 · Oct 26, 2026';
   document.querySelectorAll('.version-label').forEach(el => el.textContent = APP_VERSION);
   const { ScriptMatcher, VoiceCommandDetector } = window.MirrorCueMatcher;
   const $ = id => document.getElementById(id);
@@ -380,7 +380,7 @@
   // One recognizer at a time, strictly in sequence: a new one starts only
   // after the old one has reported onend. Safari breaks if a new session
   // starts while the old one is still shutting down.
-  let sessionStart = 0, lastResultAt = 0, gotStart = false, failStreak = 0, lastError = '', stopTimer = null, startTimer = null;
+  let sessionStart = 0, lastResultAt = 0, gotStart = false, audioOn = false, failStreak = 0, lastError = '', stopTimer = null, startTimer = null;
   const ERROR_TEXT = {
     'network': 'No internet for speech. Safari sends your voice to Apple to turn it into text, so the iPad needs working internet. Check the hotel Wi-Fi login page.',
     'not-allowed': 'Safari is blocking the microphone for this site. Tap aA in the address bar → Website Settings → Microphone → Allow, then tap Reset mic.',
@@ -409,9 +409,9 @@
     let rec;
     try { rec = new SR(); } catch (err) { setMicStatus('Could not create the speech recognizer: ' + err.message, true); return; }
     rec.continuous = true; rec.interimResults = true; rec.lang = navigator.language || 'en-US';
-    gotStart = false; lastError = '';
-    rec.onstart = () => { if (recognition !== rec) return; gotStart = true; logMic('start'); };
-    rec.onaudiostart = () => { if (recognition !== rec) return; gotStart = true; logMic('mic on'); if (!lastResultAt || $('heard').className === 'warn') setMicStatus('Listening — start reading'); };
+    gotStart = false; audioOn = false; lastError = '';
+    rec.onstart = () => { if (recognition !== rec) return; gotStart = true; logMic('start'); if ($('heard').className !== 'warn') setMicStatus('Turning the microphone on…'); };
+    rec.onaudiostart = () => { if (recognition !== rec) return; gotStart = true; audioOn = true; logMic('mic on'); if (!lastResultAt || $('heard').className === 'warn') setMicStatus('Listening — start reading'); };
     rec.onresult = e => {
       if (recognition !== rec) return;
       // Safari keeps the whole session in e.results; only the last couple of
@@ -455,10 +455,35 @@
     logMic('starting session' + (failStreak ? ' (retry ' + failStreak + ')' : '') + (navigator.onLine === false ? ' — iPad says offline' : ''));
     try { rec.start(); }
     catch (err) { recognition = null; logMic('start threw: ' + err.message); setMicStatus('Could not start listening: ' + err.message, true); failStreak++; startTimer = setTimeout(startRecognition, Math.min(10000, 1000 * failStreak)); return; }
-    // If Safari never confirms the session started, say so instead of
-    // sitting there silently.
+    // Say exactly where startup is stuck instead of sitting there silently.
+    // Safari reports two steps: the session started, then the mic turned on.
     setTimeout(() => { if (recognition === rec && !gotStart && listening) setMicStatus('Waiting for the microphone… if Safari is asking for permission, tap Allow.'); }, 3000);
-    setTimeout(() => { if (recognition === rec && !gotStart && listening) setMicStatus('The microphone didn’t start. Tap Reset mic. If it still fails, close Safari completely (swipe it away) and reopen.', true); }, 12000);
+    setTimeout(() => {
+      if (recognition !== rec || !listening || audioOn) return;
+      if (!gotStart) { logMic('stuck: session never started'); setMicStatus('The microphone didn’t start. Close Safari completely (swipe it away) and reopen. If it still fails, restart the iPad.', true); }
+      else { logMic('stuck: started, mic never turned on'); setMicStatus('Safari started listening but the microphone never switched on. Close Safari completely (swipe it away) and reopen. If it still fails, restart the iPad.', true); }
+      checkInternet();
+    }, 8000);
+    // Mic is on but no words come back: almost always no internet (Safari
+    // sends the audio to Apple to turn it into text).
+    setTimeout(() => {
+      if (recognition !== rec || !listening || !audioOn || lastResultAt >= sessionStart) return;
+      logMic('mic on 15s, no words yet');
+      checkInternet().then(ok => { if (ok && recognition === rec && lastResultAt < sessionStart && $('heard').className !== 'warn') setMicStatus('The mic is on but no words have come back yet. Say a sentence. If nothing shows up, test Dictation: open a script editor, tap the 🎤 on the keyboard and speak.'); });
+    }, 15000);
+  }
+
+  // Can the iPad actually reach the internet? A hotel Wi-Fi login page
+  // looks connected but blocks everything, including Apple's speech server.
+  async function checkInternet() {
+    if (navigator.onLine === false) { logMic('internet: iPad says offline'); setMicStatus(ERROR_TEXT['network'], true); return false; }
+    try {
+      const res = await fetch(location.href.split(/[?#]/)[0] + '?ping=' + Date.now(), { cache: 'no-store' });
+      const ok = res.ok && new URL(res.url).host === location.host;
+      logMic('internet: ' + (ok ? 'ok' : 'blocked (' + res.status + ')'));
+      if (!ok) setMicStatus(ERROR_TEXT['network'], true);
+      return ok;
+    } catch (err) { logMic('internet: failed'); setMicStatus(ERROR_TEXT['network'], true); return false; }
   }
 
   // Graceful recycle: ask the session to stop and let onend start the next
@@ -489,17 +514,20 @@
     if ((age > 45000 && quiet > 1500 && lastResultAt > sessionStart) || age > 120000) recycleRecognition();
   }, 1000);
 
-  // Reset mic: tear everything down, ask Safari for the microphone again
-  // (this brings back the "use the microphone?" prompt when Safari is set
-  // to Ask), then start a fresh recognizer.
+  // Reset mic: tear everything down, check the internet, then start a fresh
+  // recognizer (which brings back Safari's permission prompt when it's set to
+  // Ask). Only grab the mic directly if Safari refused it last time: on iOS,
+  // holding the mic first can leave speech recognition with no audio.
   async function resetMic() {
     const wasAt = spokenIdx;
     listening = false; updateListenUI();
     clearTimeout(startTimer); clearTimeout(stopTimer); startTimer = stopTimer = null;
     if (recognition) { const r = recognition; recognition = null; try { r.abort(); } catch {} }
     pendingText = null; commands.reset(); failStreak = 0;
-    setMicStatus('Asking Safari for the microphone…');
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    const refused = lastError === 'not-allowed';
+    logMic('reset');
+    if (refused && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      setMicStatus('Asking Safari for the microphone…');
       try {
         logMic('reset: asking for mic');
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -512,6 +540,8 @@
         return;
       }
     }
+    setMicStatus('Checking the internet…');
+    await checkInternet();
     // Give iOS a moment to release the mic before speech grabs it.
     setTimeout(() => {
       matcher.seek(wasAt); spokenIdx = wasAt;
