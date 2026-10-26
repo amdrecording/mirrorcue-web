@@ -18,6 +18,7 @@
   #library { background: #111; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: env(safe-area-inset-top) 0 40px; }
   #library header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px 8px; }
   #library h1 { font-size: 28px; margin: 0; }
+  #library header .btn { white-space: nowrap; }
   .btn { background: #2a2a2e; color: #fff; border: 0; border-radius: 12px; padding: 10px 16px; font-size: 16px; }
   .btn.primary { background: #ffd60a; color: #000; font-weight: 600; }
   .btn.danger { background: #5a1a1a; }
@@ -25,6 +26,7 @@
   .card h3 { margin: 0 0 6px; font-size: 18px; }
   .card p { margin: 0 0 10px; color: #aaa; font-size: 14px; max-height: 3em; overflow: hidden; }
   .card .row { display: flex; gap: 8px; }
+  .card.fresh { box-shadow: 0 0 0 2px #ffd60a; }
   #editor textarea { width: 100%; height: 55vh; background: #000; color: #fff; border: 1px solid #333; border-radius: 10px; padding: 12px; font-size: 16px; }
   #editor input { width: 100%; background: #000; color: #fff; border: 1px solid #333; border-radius: 10px; padding: 10px 12px; font-size: 18px; margin-bottom: 10px; }
   .hint { color: #888; font-size: 13px; margin: 6px 16px; }
@@ -70,9 +72,11 @@
 
 <!-- ===================== LIBRARY ===================== -->
 <section id="library" class="screen active">
-  <header><h1>MirrorCue Web</h1><button class="btn primary" id="newBtn">+ New</button></header>
+  <header><h1>MirrorCue Web</h1><div class="row" style="display:flex;gap:8px"><button class="btn primary" id="pasteBtn">📋 Paste</button><button class="btn" id="newBtn">+ New</button></div></header>
   <p class="hint">Tap a script to prompt. Voice-follow uses Safari's speech recognition (needs Wi-Fi). Turn Auto-Lock to Never while prompting.</p>
+  <p class="hint">From your Mac: copy the script (⌘C), then tap 📋 Paste here.</p>
   <p class="hint version-label"></p>
+  <div id="toast" class="hint" style="display:none;color:#ffd60a;font-size:15px"></div>
   <div id="list"></div>
 </section>
 
@@ -135,7 +139,7 @@
 (function () {
   'use strict';
   // Bump on every release so the iPad can show which build it's running.
-  const APP_VERSION = 'Version 1.4 · Oct 19, 2026';
+  const APP_VERSION = 'Version 1.5 · Oct 26, 2026';
   document.querySelectorAll('.version-label').forEach(el => el.textContent = APP_VERSION);
   const { ScriptMatcher, VoiceCommandDetector } = window.MirrorCueMatcher;
   const $ = id => document.getElementById(id);
@@ -176,6 +180,44 @@
     $('deleteBtn').style.display = s ? '' : 'none'; show('editor');
   }
   $('newBtn').onclick = () => openEditor(null);
+
+  // One-tap import: copy on the Mac (⌘C), tap Paste here. Universal
+  // Clipboard carries it across over Bluetooth, no shared Wi-Fi needed.
+  function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.display = ''; clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.display = 'none', 6000); }
+  function addScriptFromText(raw) {
+    const body = raw.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (!body) return false;
+    const dup = scripts.find(x => x.body.trim() === body || body.endsWith(x.body.trim()) && body.length - x.body.trim().length < 80);
+    if (dup) { scripts = [dup].concat(scripts.filter(x => x !== dup)); save('mc.scripts', scripts); renderList(); markFresh(); toast('Already in your library: “' + dup.title + '” (moved to the top)'); return true; }
+    // A short first line with no sentence ending is a heading: use it as the
+    // title and keep it out of the text you read. Otherwise the title is the
+    // opening words and the whole text stays in the script.
+    const lines = body.split('\n');
+    const first = lines[0].trim(), rest = lines.slice(1).join('\n').trim();
+    let title, text = body;
+    if (rest && first.split(/\s+/).length <= 10 && !/[.!?…:;,]$/.test(first)) { title = first; text = rest; }
+    else { title = first.split(/\s+/).slice(0, 7).join(' ') + (first.split(/\s+/).length > 7 ? '…' : ''); }
+    if (title.length > 60) title = title.slice(0, 57).replace(/\s+\S*$/, '') + '…';
+    scripts.unshift({ id: String(Date.now()), title, body: text });
+    save('mc.scripts', scripts); renderList(); markFresh();
+    const words = text.split(/\s+/).length;
+    toast('Added “' + title + '” · ' + words + ' words');
+    return true;
+  }
+  function markFresh() { const c = $('list').firstElementChild; if (c) { c.classList.add('fresh'); setTimeout(() => c.classList.remove('fresh'), 4000); } }
+  $('pasteBtn').onclick = async () => {
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.readText) throw new Error('no clipboard API');
+      const text = await navigator.clipboard.readText();
+      if (!addScriptFromText(text || '')) toast('The clipboard is empty. Copy the script on your Mac first (⌘C), then tap Paste within a minute or two.');
+    } catch (err) {
+      // Safari said no (or the Paste bubble was dismissed): fall back to the
+      // editor so a long-press → Paste still works.
+      openEditor(null);
+      $('bodyInput').focus();
+      $('bodyInput').placeholder = 'Long-press here and tap Paste, then Save.';
+    }
+  };
   $('cancelBtn').onclick = () => show('library');
   $('saveBtn').onclick = () => {
     const title = $('titleInput').value.trim() || 'Untitled', body = $('bodyInput').value;
